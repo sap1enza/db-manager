@@ -1,10 +1,11 @@
 class DbManager < Formula
   desc "Interactive dump/restore of PostgreSQL + Citus databases, with dumps kept locally or in S3"
   homepage "https://github.com/sap1enza/db-manager"
-  url "https://github.com/sap1enza/db-manager.git", tag: "v0.1.2"
+  url "https://github.com/sap1enza/db-manager.git", tag: "v0.1.3"
   license "MIT"
 
   depends_on "awscli"
+  depends_on "gum"
   depends_on "postgresql@17"
 
   def install

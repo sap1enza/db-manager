@@ -12,7 +12,7 @@ brew trust sap1enza/db-manager   # recent Homebrew refuses third-party taps unti
 brew install db-manager
 ```
 
-Installs `postgresql@17` (for `psql`, `pg_dump`, `pg_restore`) and `awscli`.
+Installs `postgresql@17` (for `psql`, `pg_dump`, `pg_restore`), `awscli` and `gum` (arrow-key menus).
 
 ## Use
 
@@ -31,7 +31,7 @@ The first run asks for settings and saves them to `~/.config/db-manager/config` 
 | S3 folder | `citus-dumps` (blank = bucket root) |
 | AWS key, secret, region of the bucket | blank key = default AWS CLI credentials |
 
-Then pick from the menu:
+Then pick from the menu with the arrow keys and Enter:
 
 1. Create dump on local machine
 2. Create dump and upload to S3

@@ -11,7 +11,7 @@
 # Optional env: WORK_DIR, JOBS (8), MAINTENANCE_MEM (512MB)
 set -euo pipefail
 
-VERSION=0.1.2
+VERSION=0.1.3
 CONFIG_FILE="${DB_MANAGER_CONFIG:-$HOME/.config/db-manager/config}"
 SETTINGS="SOURCE_URL TARGET_URL DUMPS_DIR S3_BUCKET S3_FOLDER AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_DEFAULT_REGION"
 
@@ -299,15 +299,21 @@ SQL
 # ---------------------------------------------------------------------------
 # local dumps and S3
 # ---------------------------------------------------------------------------
+# Arrow-key list with gum on a terminal; numbered list otherwise (piped input, no gum).
 pick() {
-  local var=$1 item PS3="Choose a number (Ctrl-D to cancel): "
+  local var=$1 item=
   shift
-  [ $# -gt 0 ] || fail "nothing to choose from"
-  select item in "$@"; do
-    [ -z "$item" ] || break
-    echo "Invalid option" >&2
-  done
-  [ -n "${item:-}" ] || fail "cancelled"
+  [ $# -gt 0 ] || { echo "Nothing to choose from." >&2; return 1; }
+  if [ -t 0 ] && command -v gum > /dev/null; then
+    item=$(gum choose "$@") || true
+  else
+    local PS3="Choose a number (Ctrl-D to cancel): "
+    select item in "$@"; do
+      [ -z "$item" ] || break
+      echo "Invalid option" >&2
+    done
+  fi
+  [ -n "$item" ] || return 1
   printf -v "$var" '%s' "$item"
 }
 
@@ -347,7 +353,7 @@ restore_s3() {
   s3_ready
   local tars=() line name
   while IFS= read -r line; do tars+=("$line"); done < <(list_s3 | awk '{print $4}')
-  pick name ${tars[@]+"${tars[@]}"}
+  pick name ${tars[@]+"${tars[@]}"} || fail "cancelled"
   WORK_DIR="$DUMPS_DIR/${name%.tar}"
   if [ -e "$WORK_DIR/restore.list" ]; then
     log "already downloaded: $WORK_DIR"
@@ -368,7 +374,7 @@ restore_local() {
   local dirs=() line
   while IFS= read -r line; do dirs+=("$(dirname "$line")"); done \
     < <(ls -1d "$DUMPS_DIR"/*/restore.list 2> /dev/null | sort -r)
-  pick WORK_DIR ${dirs[@]+"${dirs[@]}"}
+  pick WORK_DIR ${dirs[@]+"${dirs[@]}"} || fail "cancelled"
   restore
 }
 
@@ -388,19 +394,16 @@ menu() {
   while true; do
     echo
     echo "db-manager $VERSION   source: $(masked_url SOURCE_URL)  target: $(masked_url TARGET_URL)  s3: ${S3_BUCKET:-NOT SET}${S3_FOLDER:+/$S3_FOLDER}"
-    REPLY=
-    local PS3="Choose an option: " choice
-    select choice in "${options[@]}"; do break; done
-    [ -n "$REPLY" ] || exit 0
-    case $REPLY in
-      1) run dump_local ;;
-      2) run dump_s3 ;;
-      3) run restore_s3 ;;
-      4) run restore_local ;;
-      5) run list_s3 ;;
-      6) settings ;;
-      7) exit 0 ;;
-      *) echo "Invalid option: $REPLY" ;;
+    local choice
+    pick choice "${options[@]}" || exit 0
+    case $choice in
+      "${options[0]}") run dump_local ;;
+      "${options[1]}") run dump_s3 ;;
+      "${options[2]}") run restore_s3 ;;
+      "${options[3]}") run restore_local ;;
+      "${options[4]}") run list_s3 ;;
+      "${options[5]}") settings ;;
+      *) exit 0 ;;
     esac
   done
 }
