@@ -8,6 +8,7 @@ local machine or go to S3.
 
 ```sh
 brew tap sap1enza/db-manager https://github.com/sap1enza/db-manager
+brew trust sap1enza/db-manager   # recent Homebrew refuses third-party taps until trusted
 brew install db-manager
 ```
 
