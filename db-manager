@@ -11,9 +11,9 @@
 # Optional env: WORK_DIR, JOBS (8), MAINTENANCE_MEM (512MB)
 set -euo pipefail
 
-VERSION=0.1.1
+VERSION=0.1.2
 CONFIG_FILE="${DB_MANAGER_CONFIG:-$HOME/.config/db-manager/config}"
-SETTINGS="SOURCE_URL TARGET_URL DUMPS_DIR S3_URI AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_DEFAULT_REGION"
+SETTINGS="SOURCE_URL TARGET_URL DUMPS_DIR S3_BUCKET S3_FOLDER AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_DEFAULT_REGION"
 
 # shellcheck source=/dev/null
 [ ! -f "$CONFIG_FILE" ] || . "$CONFIG_FILE"
@@ -56,9 +56,9 @@ ask() {
     url)    shown=$(masked_url "$var") ;;
   esac
   if [ "$kind" = secret ]; then
-    read -r -s -p "$prompt [$shown]: " answer; echo >&2
+    read -r -s -p "$prompt${shown:+ [$shown]}: " answer; echo >&2
   else
-    read -r -p "$prompt [$shown]: " answer
+    read -r -p "$prompt${shown:+ [$shown]}: " answer
   fi
   case $answer in
     "") ;;
@@ -68,14 +68,15 @@ ask() {
 }
 
 settings() {
-  echo "Press Enter to keep the value in [brackets], or type - to clear it."
+  echo "Press Enter to keep the current value shown in [brackets], or type - to clear it."
   ask SOURCE_URL "Source DB URL to dump (postgres://citus:...@host:5432/citus?sslmode=require)" url
   ask TARGET_URL "Target DB URL to restore into" url
   ask DUMPS_DIR "Local folder for dumps"
-  ask S3_URI "S3 location (s3://bucket/prefix)"
+  ask S3_BUCKET "S3 bucket name (e.g. my-backups)"
+  ask S3_FOLDER "S3 folder inside the bucket (e.g. citus-dumps, blank = bucket root)"
   ask AWS_ACCESS_KEY_ID "AWS access key id (blank = default AWS CLI credentials)"
   ask AWS_SECRET_ACCESS_KEY "AWS secret access key" secret
-  ask AWS_DEFAULT_REGION "AWS region (e.g. us-east-1)"
+  ask AWS_DEFAULT_REGION "AWS region of the bucket (e.g. us-east-1)"
   mkdir -p "$(dirname "$CONFIG_FILE")"
   local v
   (
@@ -312,8 +313,12 @@ pick() {
 
 s3_ready() {
   need aws awscli
-  [ -n "${S3_URI:-}" ] || fail "S3_URI is not set (run: $0 settings)"
-  S3_URI=${S3_URI%/}
+  [ -n "${S3_BUCKET:-}" ] || fail "S3 bucket is not set (run: $0 settings)"
+  local bucket=${S3_BUCKET#s3://} folder=${S3_FOLDER:-}
+  bucket=${bucket%%/*}
+  folder=${folder#/}
+  folder=${folder%/}
+  S3_URI="s3://$bucket${folder:+/$folder}"
 }
 
 dump_local() {
@@ -382,7 +387,7 @@ menu() {
     "Restore dump from local machine" "List dumps on S3" "Settings" "Quit")
   while true; do
     echo
-    echo "db-manager $VERSION   source: $(masked_url SOURCE_URL)  target: $(masked_url TARGET_URL)  s3: ${S3_URI:-NOT SET}"
+    echo "db-manager $VERSION   source: $(masked_url SOURCE_URL)  target: $(masked_url TARGET_URL)  s3: ${S3_BUCKET:-NOT SET}${S3_FOLDER:+/$S3_FOLDER}"
     REPLY=
     local PS3="Choose an option: " choice
     select choice in "${options[@]}"; do break; done

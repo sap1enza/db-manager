@@ -27,8 +27,9 @@ The first run asks for settings and saves them to `~/.config/db-manager/config` 
 | Source DB URL | `postgres://citus:...@source-host:5432/citus?sslmode=require` |
 | Target DB URL | `postgres://citus:...@target-host:5432/citus?sslmode=require` |
 | Local dumps folder | `~/db-manager-dumps` |
-| S3 location | `s3://my-bucket/citus-dumps` |
-| AWS key, secret, region | blank key = default AWS CLI credentials |
+| S3 bucket | `my-backups` |
+| S3 folder | `citus-dumps` (blank = bucket root) |
+| AWS key, secret, region of the bucket | blank key = default AWS CLI credentials |
 
 Then pick from the menu:
 

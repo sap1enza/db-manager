@@ -26,7 +26,7 @@ psql -q -d $TGT -c "CREATE TABLE old_junk (id int);"
 
 # settings, dump + upload, quit
 printf '%s\n' "postgres://$USER@127.0.0.1:5432/$SRC" "postgres://$USER@127.0.0.1:5432/$TGT" "$TMP/a" \
-  s3://bucket/citus AKIATEST secret us-east-1 2 7 | ./db-manager > "$TMP/a.log" 2>&1
+  bucket citus AKIATEST secret us-east-1 2 7 | ./db-manager > "$TMP/a.log" 2>&1
 # restore from S3 into a fresh dumps folder, restore the same dump again from local, quit
 printf '%s\n' 3 1 127.0.0.1 4 1 127.0.0.1 7 | DUMPS_DIR="$TMP/b" ./db-manager > "$TMP/b.log" 2>&1
 
@@ -35,5 +35,6 @@ printf '%s\n' 3 1 127.0.0.1 4 1 127.0.0.1 7 | DUMPS_DIR="$TMP/b" ./db-manager > 
 [ "$(psql -d $TGT -Atc "SELECT shard_count FROM citus_tables WHERE table_name = 'websites'::regclass")" = 4 ]
 [ -z "$(psql -d $TGT -Atc "SELECT to_regclass('old_junk')")" ]
 [ "$(psql -d $TGT -Atc "SELECT count(*) FROM websites")" = 5000 ]
+[ -f "$TMP/s3/bucket/citus/$(ls "$TMP/a").tar" ] || { echo "upload not at bucket/citus"; exit 1; }
 dropdb $SRC; dropdb $TGT; rm -rf "$TMP"
 echo "e2e OK"
