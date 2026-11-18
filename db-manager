@@ -2,7 +2,7 @@
 # Copies the `public` schema between PostgreSQL + Citus clusters, keeping the sharding layout,
 # with dumps kept locally and/or in S3.
 #
-#   db-manager             interactive menu (asks for settings on first run)
+#   db-manager             interactive screen: Actions and Settings tabs
 #   db-manager settings    edit saved settings
 #   db-manager dump        dump SOURCE_URL into WORK_DIR
 #   db-manager restore     restore WORK_DIR into TARGET_URL
@@ -11,9 +11,8 @@
 # Optional env: WORK_DIR, JOBS (8), MAINTENANCE_MEM (512MB)
 set -euo pipefail
 
-VERSION=0.1.3
+VERSION=0.2.0
 CONFIG_FILE="${DB_MANAGER_CONFIG:-$HOME/.config/db-manager/config}"
-SETTINGS="SOURCE_URL TARGET_URL DUMPS_DIR S3_BUCKET S3_FOLDER AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_DEFAULT_REGION"
 
 # shellcheck source=/dev/null
 [ ! -f "$CONFIG_FILE" ] || . "$CONFIG_FILE"
@@ -42,23 +41,45 @@ reject_pgbouncer() { [[ "$2" != *":6432/"* ]] || fail "$1 uses PgBouncer port 64
 # ---------------------------------------------------------------------------
 # settings
 # ---------------------------------------------------------------------------
+SET_VARS=(SOURCE_URL TARGET_URL DUMPS_DIR S3_BUCKET S3_FOLDER AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_DEFAULT_REGION)
+SET_LABELS=("Source DB URL" "Target DB URL" "Local dumps folder" "S3 bucket" "S3 folder" "AWS access key id" "AWS secret key" "AWS region")
+SET_HINTS=("database to dump, postgres://user:pass@host:5432/db?sslmode=require" "database restores go into"
+  "" "e.g. my-backups" "e.g. citus-dumps, blank = bucket root" "blank = default AWS CLI credentials" "" "region of the bucket, e.g. us-east-1")
+SET_KINDS=(url url "" "" "" "" secret "")
+
+has_gum() { [ -t 0 ] && command -v gum > /dev/null; }
+
 masked_url() {
   local u=${!1:-}
   [[ "$u" != *@* ]] || u="${u%%://*}://...@${u##*@}"
   echo "${u:-NOT SET}"
 }
 
-ask() {
-  local var=$1 prompt=$2 kind=${3:-} current=${!1:-} shown answer
-  shown=$current
-  [ -z "$current" ] || case $kind in
-    secret) shown="****${current: -4}" ;;
-    url)    shown=$(masked_url "$var") ;;
+# Prints setting $1 (an index into SET_VARS) for display, with passwords and secrets masked; nothing when unset.
+shown_value() {
+  local var=${SET_VARS[$1]}
+  [ -n "${!var:-}" ] || return 0
+  case ${SET_KINDS[$1]} in
+    secret) local v=${!var}; echo "****${v: -4}" ;;
+    url)    masked_url "$var" ;;
+    *)      echo "${!var}" ;;
   esac
-  if [ "$kind" = secret ]; then
-    read -r -s -p "$prompt${shown:+ [$shown]}: " answer; echo >&2
+}
+
+ask() {
+  local i=$1 var=${SET_VARS[$1]} label=${SET_LABELS[$1]} hint=${SET_HINTS[$1]} answer flags=()
+  if has_gum; then
+    [ "${SET_KINDS[$i]}" != secret ] || flags=(--password)
+    answer=$(gum input --header "$label${hint:+ ($hint)}" --placeholder "${hint:-$label}" --value "${!var:-}" ${flags[@]+"${flags[@]}"}) || return 1
+    printf -v "$var" '%s' "${answer/#\~/$HOME}"
+    return
+  fi
+  local shown
+  shown=$(shown_value "$i")
+  if [ "${SET_KINDS[$i]}" = secret ]; then
+    read -r -s -p "$label${hint:+ ($hint)}${shown:+ [$shown]}: " answer; echo >&2
   else
-    read -r -p "$prompt${shown:+ [$shown]}: " answer
+    read -r -p "$label${hint:+ ($hint)}${shown:+ [$shown]}: " answer
   fi
   case $answer in
     "") ;;
@@ -67,23 +88,21 @@ ask() {
   esac
 }
 
-settings() {
-  echo "Press Enter to keep the current value shown in [brackets], or type - to clear it."
-  ask SOURCE_URL "Source DB URL to dump (postgres://citus:...@host:5432/citus?sslmode=require)" url
-  ask TARGET_URL "Target DB URL to restore into" url
-  ask DUMPS_DIR "Local folder for dumps"
-  ask S3_BUCKET "S3 bucket name (e.g. my-backups)"
-  ask S3_FOLDER "S3 folder inside the bucket (e.g. citus-dumps, blank = bucket root)"
-  ask AWS_ACCESS_KEY_ID "AWS access key id (blank = default AWS CLI credentials)"
-  ask AWS_SECRET_ACCESS_KEY "AWS secret access key" secret
-  ask AWS_DEFAULT_REGION "AWS region of the bucket (e.g. us-east-1)"
+save_settings() {
   mkdir -p "$(dirname "$CONFIG_FILE")"
   local v
   (
     umask 077
-    for v in $SETTINGS; do printf '[ -n "${%s:-}" ] || %s=%q\n' "$v" "$v" "${!v:-}"; done > "$CONFIG_FILE"
+    for v in "${SET_VARS[@]}"; do printf '[ -n "${%s:-}" ] || %s=%q\n' "$v" "$v" "${!v:-}"; done > "$CONFIG_FILE"
   )
   export_aws
+}
+
+settings() {
+  has_gum || echo "Press Enter to keep the current value shown in [brackets], or type - to clear it."
+  local i
+  for i in "${!SET_VARS[@]}"; do ask "$i" || true; done
+  save_settings
   echo "Saved to $CONFIG_FILE"
 }
 
@@ -304,7 +323,7 @@ pick() {
   local var=$1 item=
   shift
   [ $# -gt 0 ] || { echo "Nothing to choose from." >&2; return 1; }
-  if [ -t 0 ] && command -v gum > /dev/null; then
+  if has_gum; then
     item=$(gum choose "$@") || true
   else
     local PS3="Choose a number (Ctrl-D to cancel): "
@@ -387,26 +406,99 @@ run() {
   (( rc == 0 )) && echo "Done." || echo "Stopped (exit $rc)."
 }
 
-menu() {
-  [ -f "$CONFIG_FILE" ] || { echo "First run: let's save your settings."; settings; }
-  local options=("Create dump on local machine" "Create dump and upload to S3" "Restore dump from S3"
-    "Restore dump from local machine" "List dumps on S3" "Settings" "Quit")
+ACTIONS=("Create dump on local machine" "Create dump and upload to S3" "Restore dump from S3"
+  "Restore dump from local machine" "List dumps on S3")
+ACTION_FNS=(dump_local dump_s3 restore_s3 restore_local list_s3)
+TABS=(Actions Settings)
+
+read_key() {
+  local k rest=
+  IFS= read -rsn1 k || { KEY=quit; return; }
+  # arrows arrive as ESC [ A..D; a lone Esc times out
+  [ "$k" != $'\e' ] || IFS= read -rsn2 -t 1 rest || true
+  case "$k$rest" in
+    $'\e[A'|k) KEY=up ;;
+    $'\e[B'|j) KEY=down ;;
+    $'\e[C'|l|$'\t') KEY=right ;;
+    $'\e[D'|h) KEY=left ;;
+    "")        KEY=enter ;;
+    q|Q|$'\e') KEY=quit ;;
+    *)         KEY=other ;;
+  esac
+}
+
+draw() {
+  local tab=$1 sel=$2 i shown
+  printf '\033[H\033[2J\n  \033[1mdb-manager\033[0m \033[2mv%s\033[0m\n\n ' "$VERSION"
+  for i in "${!TABS[@]}"; do
+    if (( i == tab )); then printf ' \033[7m %s \033[0m' "${TABS[$i]}"; else printf '  %s ' "${TABS[$i]}"; fi
+  done
+  printf '\n\n'
+  if (( tab == 0 )); then
+    for i in "${!ACTIONS[@]}"; do
+      if (( i == sel )); then printf '  \033[36m> %s\033[0m\n' "${ACTIONS[$i]}"; else printf '    %s\n' "${ACTIONS[$i]}"; fi
+    done
+  else
+    for i in "${!SET_VARS[@]}"; do
+      shown=$(shown_value "$i")
+      if (( i == sel )); then printf '  \033[36m> %-20s\033[0m' "${SET_LABELS[$i]}"; else printf '    %-20s' "${SET_LABELS[$i]}"; fi
+      if [ -n "$shown" ]; then printf ' %s\n' "$shown"; else printf ' \033[2mnot set\033[0m\n'; fi
+    done
+  fi
+  printf '\n  \033[2m%s\033[0m\n' "${STATUS:-up/down move   left/right switch tab   enter select   q quit}"
+  STATUS=
+}
+
+tui() {
+  local tab=0 sel=0 count
+  trap 'printf "\033[?25h"' EXIT
+  [ -f "$CONFIG_FILE" ] || { tab=1; STATUS="First run: press enter on each setting to fill it in."; }
   while true; do
-    echo
-    echo "db-manager $VERSION   source: $(masked_url SOURCE_URL)  target: $(masked_url TARGET_URL)  s3: ${S3_BUCKET:-NOT SET}${S3_FOLDER:+/$S3_FOLDER}"
-    local choice
-    pick choice "${options[@]}" || exit 0
-    case $choice in
-      "${options[0]}") run dump_local ;;
-      "${options[1]}") run dump_s3 ;;
-      "${options[2]}") run restore_s3 ;;
-      "${options[3]}") run restore_local ;;
-      "${options[4]}") run list_s3 ;;
-      "${options[5]}") settings ;;
-      *) exit 0 ;;
+    count=${#ACTIONS[@]}
+    (( tab == 0 )) || count=${#SET_VARS[@]}
+    printf '\033[?25l'
+    draw "$tab" "$sel"
+    read_key
+    case $KEY in
+      up)         sel=$(( (sel + count - 1) % count )) ;;
+      down)       sel=$(( (sel + 1) % count )) ;;
+      left|right) tab=$(( 1 - tab )); sel=0 ;;
+      enter)
+        printf '\033[?25h\033[H\033[2J'
+        if (( tab == 0 )); then
+          echo "${ACTIONS[$sel]}"
+          echo
+          run "${ACTION_FNS[$sel]}"
+          read -r -p "Press enter to go back " _ || true
+        else
+          if ask "$sel"; then
+            save_settings
+            STATUS="Saved ${SET_LABELS[$sel]}."
+          else
+            STATUS="${SET_LABELS[$sel]} not changed."
+          fi
+        fi ;;
+      quit) printf '\033[?25h\033[H\033[2J'; return ;;
     esac
   done
 }
+
+# Numbered menu for piped input (scripts, tests).
+plain_menu() {
+  [ -f "$CONFIG_FILE" ] || { echo "First run: let's save your settings."; settings; }
+  local choice i
+  while true; do
+    echo
+    pick choice "${ACTIONS[@]}" Settings Quit || exit 0
+    case $choice in
+      Settings) settings ;;
+      Quit)     exit 0 ;;
+      *) for i in "${!ACTIONS[@]}"; do [ "${ACTIONS[$i]}" != "$choice" ] || run "${ACTION_FNS[$i]}"; done ;;
+    esac
+  done
+}
+
+menu() { if [ -t 0 ] && [ -t 1 ]; then tui; else plain_menu; fi; }
 
 case "${1:-}" in
   "")          menu ;;

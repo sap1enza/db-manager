@@ -20,7 +20,15 @@ Installs `postgresql@17` (for `psql`, `pg_dump`, `pg_restore`), `awscli` and `gu
 db-manager
 ```
 
-The first run asks for settings and saves them to `~/.config/db-manager/config` (mode 600):
+Two tabs, switched with ←/→:
+
+- **Actions**: create dump on local machine, create dump and upload to S3, restore dump from S3,
+  restore dump from local machine, list dumps on S3.
+- **Settings**: every stored value (passwords masked). Enter on one to edit it; it is saved right away.
+
+↑/↓ move, Enter selects, q or Esc quits. The first run opens on Settings.
+
+Settings are saved to `~/.config/db-manager/config` (mode 600):
 
 | Setting | Example |
 | --- | --- |
@@ -30,15 +38,6 @@ The first run asks for settings and saves them to `~/.config/db-manager/config` 
 | S3 bucket | `my-backups` |
 | S3 folder | `citus-dumps` (blank = bucket root) |
 | AWS key, secret, region of the bucket | blank key = default AWS CLI credentials |
-
-Then pick from the menu with the arrow keys and Enter:
-
-1. Create dump on local machine
-2. Create dump and upload to S3
-3. Restore dump from S3
-4. Restore dump from local machine
-5. List dumps on S3
-6. Settings
 
 Restoring **drops every table in `public` on the target** and asks you to type the target host first.
 
