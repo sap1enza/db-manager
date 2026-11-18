@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Fake aws CLI for test/e2e.sh: s3://bucket/key is stored at $FAKE_S3/bucket/key.
+echo "aws $* key=${AWS_ACCESS_KEY_ID:-} region=${AWS_DEFAULT_REGION:-}" >> "$FAKE_S3/calls.log"
+p() { echo "$FAKE_S3/${1#s3://}"; }
+case "$1 $2" in
+  "s3 cp") if [ "$3" = - ]; then mkdir -p "$(dirname "$(p "$4")")"; cat > "$(p "$4")"; else cat "$(p "$3")"; fi ;;
+  "s3 ls") for f in "$(p "$3")"*; do [ -f "$f" ] && echo "2026-11-18 10:00:00 $(wc -c < "$f" | tr -d ' ') $(basename "$f")"; done; echo "                           PRE subdir/" ;;
+  *) exit 2 ;;
+esac

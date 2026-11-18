@@ -1,0 +1,431 @@
+#!/usr/bin/env bash
+# Copies the `public` schema between PostgreSQL + Citus clusters, keeping the sharding layout,
+# with dumps kept locally and/or in S3.
+#
+#   db-manager             interactive menu (asks for settings on first run)
+#   db-manager settings    edit saved settings
+#   db-manager dump        dump SOURCE_URL into WORK_DIR
+#   db-manager restore     restore WORK_DIR into TARGET_URL
+#
+# Settings live in ~/.config/db-manager/config (mode 600). Env vars win over saved settings.
+# Optional env: WORK_DIR, JOBS (8), MAINTENANCE_MEM (512MB)
+set -euo pipefail
+
+VERSION=0.1.0
+CONFIG_FILE="${DB_MANAGER_CONFIG:-$HOME/.config/db-manager/config}"
+SETTINGS="SOURCE_URL TARGET_URL DUMPS_DIR COUNT_TABLES S3_URI AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_DEFAULT_REGION"
+
+# shellcheck source=/dev/null
+[ ! -f "$CONFIG_FILE" ] || . "$CONFIG_FILE"
+DUMPS_DIR="${DUMPS_DIR:-$HOME/db-manager-dumps}"
+JOBS="${JOBS:-8}"
+MAINTENANCE_MEM="${MAINTENANCE_MEM:-512MB}"
+COUNT_TABLES="${COUNT_TABLES:-}"
+export_aws() {
+  local v
+  for v in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_DEFAULT_REGION; do
+    if [ -n "${!v:-}" ]; then export "${v?}"; else unset "$v"; fi
+  done
+}
+export_aws
+
+START=$SECONDS
+STEP_START=$SECONDS
+log()  { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
+step() { log ""; log "=== $* ==="; STEP_START=$SECONDS; }
+done_step() { log "done in $((SECONDS - STEP_START))s"; }
+fail() { log "FAILED: $*"; exit 1; }
+need() { command -v "$1" > /dev/null || fail "$1 not found (brew install $2)"; }
+src()  { psql "$SOURCE_URL" -At -v ON_ERROR_STOP=1 "$@"; }
+tgt()  { psql "$TARGET_URL" -At -v ON_ERROR_STOP=1 "$@"; }
+reject_pgbouncer() { [[ "$2" != *":6432/"* ]] || fail "$1 uses PgBouncer port 6432; use 5432"; }
+
+# ---------------------------------------------------------------------------
+# settings
+# ---------------------------------------------------------------------------
+masked_url() {
+  local u=${!1:-}
+  [[ "$u" != *@* ]] || u="${u%%://*}://...@${u##*@}"
+  echo "${u:-NOT SET}"
+}
+
+ask() {
+  local var=$1 prompt=$2 kind=${3:-} current=${!1:-} shown answer
+  shown=$current
+  [ -z "$current" ] || case $kind in
+    secret) shown="****${current: -4}" ;;
+    url)    shown=$(masked_url "$var") ;;
+  esac
+  if [ "$kind" = secret ]; then
+    read -r -s -p "$prompt [$shown]: " answer; echo >&2
+  else
+    read -r -p "$prompt [$shown]: " answer
+  fi
+  case $answer in
+    "") ;;
+    -)  printf -v "$var" '' ;;
+    *)  printf -v "$var" '%s' "${answer/#\~/$HOME}" ;;
+  esac
+}
+
+settings() {
+  echo "Press Enter to keep the value in [brackets], or type - to clear it."
+  ask SOURCE_URL "Source DB URL to dump (postgres://citus:...@host:5432/citus?sslmode=require)" url
+  ask TARGET_URL "Target DB URL to restore into" url
+  ask DUMPS_DIR "Local folder for dumps"
+  ask COUNT_TABLES "Tables whose row counts are compared after restore (space separated, blank = none)"
+  ask S3_URI "S3 location (s3://bucket/prefix)"
+  ask AWS_ACCESS_KEY_ID "AWS access key id (blank = default AWS CLI credentials)"
+  ask AWS_SECRET_ACCESS_KEY "AWS secret access key" secret
+  ask AWS_DEFAULT_REGION "AWS region (e.g. us-east-1)"
+  mkdir -p "$(dirname "$CONFIG_FILE")"
+  local v
+  (
+    umask 077
+    for v in $SETTINGS; do printf '[ -n "${%s:-}" ] || %s=%q\n' "$v" "$v" "${!v:-}"; done > "$CONFIG_FILE"
+  )
+  export_aws
+  echo "Saved to $CONFIG_FILE"
+}
+
+# ---------------------------------------------------------------------------
+# dump
+# ---------------------------------------------------------------------------
+dump() {
+  [ -n "${SOURCE_URL:-}" ] || fail "SOURCE_URL is not set (run: $0 settings)"
+  need pg_dump postgresql@17
+  mkdir -p "$WORK_DIR"
+  [ ! -e "$WORK_DIR/citus_dump" ] || fail "$WORK_DIR/citus_dump already exists. Remove it or set another WORK_DIR."
+  WORK_DIR=$(cd "$WORK_DIR" && pwd)
+  exec > >(tee -a "$WORK_DIR/dump.log") 2>&1
+  echo "Saving to: $WORK_DIR  (dump: $WORK_DIR/citus_dump/, log: $WORK_DIR/dump.log)"
+
+  step "1/5 Check source and client"
+  reject_pgbouncer SOURCE_URL "$SOURCE_URL"
+  local server_major client_major
+  server_major=$(src -c "SELECT current_setting('server_version_num')::int / 10000")
+  client_major=$(pg_dump --version | grep -oE '[0-9]+' | head -1)
+  log "source: $(src -c "SELECT host(inet_server_addr()) || ' / ' || current_database()")"
+  log "server PostgreSQL $server_major, pg_dump $client_major"
+  (( client_major >= server_major )) || fail "pg_dump is older than the server"
+  (( client_major == server_major )) || log "WARN: pg_dump newer than server; restore will log harmless transaction_timeout errors"
+  src -c "SELECT host(inet_server_addr()) || ' / ' || current_database()" > "$WORK_DIR/source_host"
+  # extensions in public (e.g. hll, hstore) define types the dump uses; restore needs them on the target
+  src -c "SELECT e.extname FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace WHERE n.nspname = 'public' ORDER BY e.extname COLLATE \"C\"" \
+    > "$WORK_DIR/source_extensions.txt"
+  done_step
+
+  step "2/5 Snapshot source layout, sharding SQL and row counts"
+  src -F '|' -c "SELECT table_name::text, citus_table_type, distribution_column, shard_count FROM citus_tables ORDER BY 1" \
+    > "$WORK_DIR/source_layout.txt"
+  src > "$WORK_DIR/distribute.sql" <<'SQL'
+SELECT CASE t.citus_table_type
+         WHEN 'reference'   THEN format('SELECT create_reference_table(%L);', t.table_name)
+         WHEN 'distributed' THEN format('SELECT create_distributed_table(%L, %L, shard_count => %s);',
+                                        t.table_name, t.distribution_column, t.shard_count)
+       END
+FROM citus_tables t
+JOIN pg_class c ON c.oid = t.table_name
+WHERE t.citus_table_type IN ('reference', 'distributed')
+  AND NOT c.relispartition
+ORDER BY t.citus_table_type DESC, t.table_name::text;
+SQL
+  log "reference tables:   $(grep -c create_reference_table "$WORK_DIR/distribute.sql" || true)"
+  log "distributed tables: $(grep -c create_distributed_table "$WORK_DIR/distribute.sql" || true)"
+  : > "$WORK_DIR/source_counts.txt"
+  [ -n "$COUNT_TABLES" ] || log "no COUNT_TABLES set; row counts will not be compared"
+  local t n
+  for t in $COUNT_TABLES; do
+    n=$(src -c "SELECT count(*) FROM public.$t")
+    echo "$t|$n" >> "$WORK_DIR/source_counts.txt"
+    log "  $t: $n rows"
+  done
+  done_step
+
+  step "3/5 Dump public schema ($JOBS jobs)"
+  pg_dump "$SOURCE_URL" -Fd -j "$JOBS" -Z 1 -n public --no-owner --no-privileges -v -f "$WORK_DIR/citus_dump"
+  log "dump size: $(du -sh "$WORK_DIR/citus_dump" | cut -f1)"
+  done_step
+
+  step "4/5 Build restore list"
+  pg_restore -l "$WORK_DIR/citus_dump" \
+    | grep -v -E ' (FUNCTION|AGGREGATE|PROCEDURE) |SCHEMA - public|COMMENT - SCHEMA public' \
+    > "$WORK_DIR/restore.list"
+  log "items: $(grep -vc '^;' "$WORK_DIR/restore.list")  (tables: $(grep -c ' TABLE public ' "$WORK_DIR/restore.list" || true), indexes: $(grep -c ' INDEX public ' "$WORK_DIR/restore.list" || true))"
+  local shards
+  shards=$(grep -E 'TABLE (DATA )?public [a-z_]+_[0-9]{6,} ' "$WORK_DIR/restore.list" || true)
+  [ -z "$shards" ] || { log "$shards"; fail "dump contains Citus shard tables (above)"; }
+  log "no shard tables in dump"
+  done_step
+
+  step "5/5 Summary"
+  log "work dir:  $WORK_DIR"
+  log "files:     $(ls "$WORK_DIR" | tr '\n' ' ')"
+  log "elapsed:   $((SECONDS - START))s"
+}
+
+# ---------------------------------------------------------------------------
+# restore
+# ---------------------------------------------------------------------------
+# Runs one pg_restore section; stops on any error except the harmless transaction_timeout one.
+restore_section() {
+  local section=$1; shift
+  local out="$WORK_DIR/restore_$section.log"
+  set +e
+  pg_restore -v --no-owner --no-privileges -L "$WORK_DIR/restore.list" --section="$section" \
+    -d "$TARGET_URL" "$@" "$WORK_DIR/citus_dump" 2>&1 | tee "$out"
+  set -e
+  local errors
+  # -j interleaves workers' output, so an error header can land on a line without its message;
+  # count server ERROR lines and other pg_restore errors, minus the harmless transaction_timeout noise.
+  errors=$(grep -E 'ERROR:|pg_restore: error:' "$out" | grep -vcE 'transaction_timeout|while PROCESSING TOC' || true)
+  if (( errors > 0 )); then
+    grep -E 'ERROR:|pg_restore: error:' "$out" | grep -vE 'transaction_timeout|while PROCESSING TOC' | head -40
+    fail "$errors error(s) in $section (full output: $out)"
+  fi
+  log "$section: no errors"
+}
+
+restore() {
+  [ -n "${TARGET_URL:-}" ] || fail "TARGET_URL is not set (run: $0 settings)"
+  need pg_restore postgresql@17
+  local f
+  for f in citus_dump restore.list distribute.sql source_host source_extensions.txt source_layout.txt source_counts.txt; do
+    [ -e "$WORK_DIR/$f" ] || fail "missing $WORK_DIR/$f — run a dump first (same WORK_DIR)"
+  done
+  WORK_DIR=$(cd "$WORK_DIR" && pwd)
+  exec > >(tee -a "$WORK_DIR/restore.log") 2>&1
+  echo "Restoring from: $WORK_DIR/citus_dump/  (log: $WORK_DIR/restore.log)"
+
+  step "1/8 Check target"
+  reject_pgbouncer TARGET_URL "$TARGET_URL"
+  local target_host target missing
+  target_host=$(tgt -c "SELECT host(inet_server_addr())")
+  [ -n "$target_host" ] || fail "TARGET_URL must connect over TCP (host:port), not a Unix socket"
+  target="$target_host / $(tgt -c "SELECT current_database()")"
+  log "source: $(cat "$WORK_DIR/source_host")"
+  log "target: $target"
+  [ "$target" != "$(cat "$WORK_DIR/source_host")" ] || fail "target is the database this dump came from"
+  missing=$(LC_ALL=C comm -23 "$WORK_DIR/source_extensions.txt" <(tgt -c "SELECT extname FROM pg_extension ORDER BY extname COLLATE \"C\"") | paste -sd, -)
+  [ -z "$missing" ] || fail "extensions on source but not on target: $missing (run: SELECT create_extension('<name>');)"
+  log "target has the extensions the dump needs: $(paste -sd, - < "$WORK_DIR/source_extensions.txt")"
+  log "app tables on target now: $(tgt -c "SELECT count(*) FROM pg_tables WHERE schemaname = 'public'")"
+  done_step
+
+  log ""
+  log "This DELETES every app table and type in public on $target."
+  local confirm
+  read -r -p "Type the target host ($target_host) to continue: " confirm
+  [ "$confirm" = "$target_host" ] || fail "confirmation did not match"
+
+  step "2/8 Wipe app objects on target"
+  tgt <<'SQL'
+SET citus.multi_shard_modify_mode TO 'sequential';
+DO $$
+DECLARE r record;
+BEGIN
+  FOR r IN
+    SELECT c.relkind, c.relname
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'public'
+      AND c.relkind IN ('r', 'p', 'v', 'm', 'S')
+      AND NOT c.relispartition
+      AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.objid = c.oid AND d.deptype = 'e')
+  LOOP
+    RAISE NOTICE 'drop %', r.relname;
+    EXECUTE format('DROP %s IF EXISTS public.%I CASCADE',
+      CASE r.relkind WHEN 'v' THEN 'VIEW' WHEN 'm' THEN 'MATERIALIZED VIEW'
+                     WHEN 'S' THEN 'SEQUENCE' ELSE 'TABLE' END,
+      r.relname);
+  END LOOP;
+  FOR r IN
+    SELECT t.typname, t.typtype
+    FROM pg_type t
+    JOIN pg_namespace n ON n.oid = t.typnamespace
+    WHERE n.nspname = 'public'
+      AND t.typtype IN ('e', 'd', 'c')
+      AND (t.typtype <> 'c' OR (SELECT relkind FROM pg_class WHERE oid = t.typrelid) = 'c')
+      AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.objid = t.oid AND d.deptype = 'e')
+  LOOP
+    RAISE NOTICE 'drop type %', r.typname;
+    EXECUTE format('DROP %s IF EXISTS public.%I CASCADE', CASE r.typtype WHEN 'd' THEN 'DOMAIN' ELSE 'TYPE' END, r.typname);
+  END LOOP;
+END $$;
+SQL
+  local left
+  left=$(tgt -c "SELECT count(*) FROM pg_tables WHERE schemaname = 'public'")
+  (( left == 0 )) || fail "$left tables still in public after wipe"
+  log "public is empty"
+  done_step
+
+  export PGOPTIONS="-c maintenance_work_mem=$MAINTENANCE_MEM -c synchronous_commit=off"
+
+  step "3/8 Restore schema (empty tables)"
+  restore_section pre-data
+  done_step
+
+  step "4/8 Shard tables like the source"
+  local total i=0 stmt
+  total=$(grep -c . "$WORK_DIR/distribute.sql" || true)
+  while IFS= read -r stmt; do
+    [ -n "$stmt" ] || continue
+    i=$((i + 1))
+    log "  [$i/$total] $stmt"
+    tgt -c "$stmt" > /dev/null || fail "sharding failed at: $stmt"
+  done < "$WORK_DIR/distribute.sql"
+  done_step
+
+  step "5/8 Load data ($JOBS jobs)"
+  log "watch the current COPY from another terminal:"
+  log "  psql \"\$TARGET_URL\" -c \"SELECT relid::regclass, bytes_processed/1024/1024 AS mb, tuples_processed FROM pg_stat_progress_copy;\""
+  restore_section data -j "$JOBS"
+  done_step
+
+  step "6/8 Indexes, primary keys, foreign keys ($JOBS jobs)"
+  log "if this fails with lock / parallel operation errors, re-run it without -j (JOBS=1)"
+  restore_section post-data -j "$JOBS"
+  done_step
+
+  step "7/8 ANALYZE"
+  tgt -c "ANALYZE" > /dev/null
+  done_step
+
+  step "8/8 Verify against source snapshot"
+  tgt -F '|' -c "SELECT table_name::text, citus_table_type, distribution_column, shard_count FROM citus_tables ORDER BY 1" \
+    > "$WORK_DIR/target_layout.txt"
+  if diff -u "$WORK_DIR/source_layout.txt" "$WORK_DIR/target_layout.txt"; then
+    log "sharding layout matches source ($(wc -l < "$WORK_DIR/target_layout.txt" | tr -d ' ') tables)"
+  else
+    log "WARN: sharding layout differs from source (diff above)"
+  fi
+  local mismatches=0 t n m
+  while IFS='|' read -r t n; do
+    m=$(tgt -c "SELECT count(*) FROM public.$t")
+    if [ "$m" = "$n" ]; then
+      log "  $t: $m rows OK"
+    else
+      log "  $t: source $n vs target $m  MISMATCH"
+      mismatches=$((mismatches + 1))
+    fi
+  done < "$WORK_DIR/source_counts.txt"
+  (( mismatches == 0 )) || log "WARN: $mismatches count mismatch(es); counts were taken just before the dump, so a live source can drift slightly"
+  done_step
+
+  log ""
+  log "Restore finished in $((SECONDS - START))s. Log: $WORK_DIR/restore.log"
+}
+
+# ---------------------------------------------------------------------------
+# local dumps and S3
+# ---------------------------------------------------------------------------
+pick() {
+  local var=$1 item PS3="Choose a number (Ctrl-D to cancel): "
+  shift
+  [ $# -gt 0 ] || fail "nothing to choose from"
+  select item in "$@"; do
+    [ -z "$item" ] || break
+    echo "Invalid option" >&2
+  done
+  [ -n "${item:-}" ] || fail "cancelled"
+  printf -v "$var" '%s' "$item"
+}
+
+s3_ready() {
+  need aws awscli
+  [ -n "${S3_URI:-}" ] || fail "S3_URI is not set (run: $0 settings)"
+  S3_URI=${S3_URI%/}
+}
+
+dump_local() {
+  WORK_DIR="$DUMPS_DIR/$(date -u +%Y%m%d-%H%M%S)"
+  dump
+}
+
+dump_s3() {
+  s3_ready
+  dump_local
+  local name size
+  name=$(basename "$WORK_DIR")
+  # A streamed upload can't size its parts itself; the dump is already compressed, so the tar is about its size.
+  size=$(du -sk "$WORK_DIR" | awk '{printf "%d", $1 * 1024 * 1.1}')
+  step "Upload to $S3_URI/$name.tar ($(du -sh "$WORK_DIR" | cut -f1))"
+  tar -C "$DUMPS_DIR" -cf - "$name" | aws s3 cp - "$S3_URI/$name.tar" --expected-size "$size"
+  done_step
+}
+
+list_s3() {
+  s3_ready
+  aws s3 ls "$S3_URI/" | awk '$4 ~ /\.tar$/'
+}
+
+restore_s3() {
+  s3_ready
+  local tars=() line name
+  while IFS= read -r line; do tars+=("$line"); done < <(list_s3 | awk '{print $4}')
+  pick name ${tars[@]+"${tars[@]}"}
+  WORK_DIR="$DUMPS_DIR/${name%.tar}"
+  if [ -e "$WORK_DIR/restore.list" ]; then
+    log "already downloaded: $WORK_DIR"
+  else
+    local tmp
+    mkdir -p "$DUMPS_DIR"
+    tmp=$(mktemp -d "$DUMPS_DIR/.download.XXXXXX")
+    log "downloading $S3_URI/$name into $DUMPS_DIR"
+    aws s3 cp "$S3_URI/$name" - | tar -C "$tmp" -xf -
+    rm -rf "$WORK_DIR"
+    mv "$tmp/${name%.tar}" "$WORK_DIR"
+    rmdir "$tmp"
+  fi
+  restore
+}
+
+restore_local() {
+  local dirs=() line
+  while IFS= read -r line; do dirs+=("$(dirname "$line")"); done \
+    < <(ls -1d "$DUMPS_DIR"/*/restore.list 2> /dev/null | sort -r)
+  pick WORK_DIR ${dirs[@]+"${dirs[@]}"}
+  restore
+}
+
+# Each action runs in a subshell so its log redirection and `fail` exit return to the menu.
+run() {
+  set +e
+  ( set -e; "$@" )
+  local rc=$?
+  set -e
+  (( rc == 0 )) && echo "Done." || echo "Stopped (exit $rc)."
+}
+
+menu() {
+  [ -f "$CONFIG_FILE" ] || { echo "First run: let's save your settings."; settings; }
+  local options=("Create dump on local machine" "Create dump and upload to S3" "Restore dump from S3"
+    "Restore dump from local machine" "List dumps on S3" "Settings" "Quit")
+  while true; do
+    echo
+    echo "db-manager $VERSION   source: $(masked_url SOURCE_URL)  target: $(masked_url TARGET_URL)  s3: ${S3_URI:-NOT SET}"
+    REPLY=
+    local PS3="Choose an option: " choice
+    select choice in "${options[@]}"; do break; done
+    [ -n "$REPLY" ] || exit 0
+    case $REPLY in
+      1) run dump_local ;;
+      2) run dump_s3 ;;
+      3) run restore_s3 ;;
+      4) run restore_local ;;
+      5) run list_s3 ;;
+      6) settings ;;
+      7) exit 0 ;;
+      *) echo "Invalid option: $REPLY" ;;
+    esac
+  done
+}
+
+case "${1:-}" in
+  "")          menu ;;
+  settings)    settings ;;
+  dump)        WORK_DIR="${WORK_DIR:-$DUMPS_DIR/$(date -u +%Y%m%d-%H%M%S)}"; dump ;;
+  restore)     [ -n "${WORK_DIR:-}" ] || fail "set WORK_DIR to a dump folder"; restore ;;
+  -v|--version) echo "db-manager $VERSION" ;;
+  *)           awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; exit 1 ;;
+esac
