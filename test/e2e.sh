@@ -26,13 +26,14 @@ psql -q -d $TGT -c "CREATE TABLE old_junk (id int);"
 
 # settings, dump + upload, quit
 printf '%s\n' "postgres://$USER@127.0.0.1:5432/$SRC" "postgres://$USER@127.0.0.1:5432/$TGT" "$TMP/a" \
-  "accounts websites" s3://bucket/citus AKIATEST secret us-east-1 2 7 | ./db-manager > "$TMP/a.log" 2>&1
+  s3://bucket/citus AKIATEST secret us-east-1 2 7 | ./db-manager > "$TMP/a.log" 2>&1
 # restore from S3 into a fresh dumps folder, restore the same dump again from local, quit
 printf '%s\n' 3 1 127.0.0.1 4 1 127.0.0.1 7 | DUMPS_DIR="$TMP/b" ./db-manager > "$TMP/b.log" 2>&1
 
 [ "$(stat -f %Lp "$TMP/config")" = 600 ] || { echo "config not 600"; exit 1; }
-[ "$(grep -c 'websites: 5000 rows OK' "$TMP/b.log")" = 2 ] || { cat "$TMP/b.log"; echo "restore check failed"; exit 1; }
+[ "$(grep -c 'sharding layout matches source' "$TMP/b.log")" = 2 ] || { cat "$TMP/b.log"; echo "restore check failed"; exit 1; }
 [ "$(psql -d $TGT -Atc "SELECT shard_count FROM citus_tables WHERE table_name = 'websites'::regclass")" = 4 ]
 [ -z "$(psql -d $TGT -Atc "SELECT to_regclass('old_junk')")" ]
+[ "$(psql -d $TGT -Atc "SELECT count(*) FROM websites")" = 5000 ]
 dropdb $SRC; dropdb $TGT; rm -rf "$TMP"
 echo "e2e OK"

@@ -27,7 +27,6 @@ The first run asks for settings and saves them to `~/.config/db-manager/config` 
 | Source DB URL | `postgres://citus:...@source-host:5432/citus?sslmode=require` |
 | Target DB URL | `postgres://citus:...@target-host:5432/citus?sslmode=require` |
 | Local dumps folder | `~/db-manager-dumps` |
-| Tables to compare row counts | `accounts users` (blank = none) |
 | S3 location | `s3://my-bucket/citus-dumps` |
 | AWS key, secret, region | blank key = default AWS CLI credentials |
 
@@ -51,7 +50,7 @@ Scripted use: `db-manager dump`, `WORK_DIR=~/db-manager-dumps/<name> db-manager 
 
 Each dump is a folder named by UTC timestamp, uploaded to S3 as one `<name>.tar`:
 the `pg_dump` directory-format dump of `public`, the restore list, the `create_*_table` calls that
-recreate the sharding, and source snapshots (layout, row counts, extensions) used to verify the restore.
+recreate the sharding, and source snapshots (layout, extensions) used to verify the restore.
 
 Use port 5432, not PgBouncer (6432).
 

@@ -13,14 +13,13 @@ set -euo pipefail
 
 VERSION=0.1.0
 CONFIG_FILE="${DB_MANAGER_CONFIG:-$HOME/.config/db-manager/config}"
-SETTINGS="SOURCE_URL TARGET_URL DUMPS_DIR COUNT_TABLES S3_URI AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_DEFAULT_REGION"
+SETTINGS="SOURCE_URL TARGET_URL DUMPS_DIR S3_URI AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_DEFAULT_REGION"
 
 # shellcheck source=/dev/null
 [ ! -f "$CONFIG_FILE" ] || . "$CONFIG_FILE"
 DUMPS_DIR="${DUMPS_DIR:-$HOME/db-manager-dumps}"
 JOBS="${JOBS:-8}"
 MAINTENANCE_MEM="${MAINTENANCE_MEM:-512MB}"
-COUNT_TABLES="${COUNT_TABLES:-}"
 export_aws() {
   local v
   for v in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_DEFAULT_REGION; do
@@ -73,7 +72,6 @@ settings() {
   ask SOURCE_URL "Source DB URL to dump (postgres://citus:...@host:5432/citus?sslmode=require)" url
   ask TARGET_URL "Target DB URL to restore into" url
   ask DUMPS_DIR "Local folder for dumps"
-  ask COUNT_TABLES "Tables whose row counts are compared after restore (space separated, blank = none)"
   ask S3_URI "S3 location (s3://bucket/prefix)"
   ask AWS_ACCESS_KEY_ID "AWS access key id (blank = default AWS CLI credentials)"
   ask AWS_SECRET_ACCESS_KEY "AWS secret access key" secret
@@ -115,7 +113,7 @@ dump() {
     > "$WORK_DIR/source_extensions.txt"
   done_step
 
-  step "2/5 Snapshot source layout, sharding SQL and row counts"
+  step "2/5 Snapshot source layout and sharding SQL"
   src -F '|' -c "SELECT table_name::text, citus_table_type, distribution_column, shard_count FROM citus_tables ORDER BY 1" \
     > "$WORK_DIR/source_layout.txt"
   src > "$WORK_DIR/distribute.sql" <<'SQL'
@@ -132,14 +130,6 @@ ORDER BY t.citus_table_type DESC, t.table_name::text;
 SQL
   log "reference tables:   $(grep -c create_reference_table "$WORK_DIR/distribute.sql" || true)"
   log "distributed tables: $(grep -c create_distributed_table "$WORK_DIR/distribute.sql" || true)"
-  : > "$WORK_DIR/source_counts.txt"
-  [ -n "$COUNT_TABLES" ] || log "no COUNT_TABLES set; row counts will not be compared"
-  local t n
-  for t in $COUNT_TABLES; do
-    n=$(src -c "SELECT count(*) FROM public.$t")
-    echo "$t|$n" >> "$WORK_DIR/source_counts.txt"
-    log "  $t: $n rows"
-  done
   done_step
 
   step "3/5 Dump public schema ($JOBS jobs)"
@@ -190,7 +180,7 @@ restore() {
   [ -n "${TARGET_URL:-}" ] || fail "TARGET_URL is not set (run: $0 settings)"
   need pg_restore postgresql@17
   local f
-  for f in citus_dump restore.list distribute.sql source_host source_extensions.txt source_layout.txt source_counts.txt; do
+  for f in citus_dump restore.list distribute.sql source_host source_extensions.txt source_layout.txt; do
     [ -e "$WORK_DIR/$f" ] || fail "missing $WORK_DIR/$f — run a dump first (same WORK_DIR)"
   done
   WORK_DIR=$(cd "$WORK_DIR" && pwd)
@@ -299,17 +289,6 @@ SQL
   else
     log "WARN: sharding layout differs from source (diff above)"
   fi
-  local mismatches=0 t n m
-  while IFS='|' read -r t n; do
-    m=$(tgt -c "SELECT count(*) FROM public.$t")
-    if [ "$m" = "$n" ]; then
-      log "  $t: $m rows OK"
-    else
-      log "  $t: source $n vs target $m  MISMATCH"
-      mismatches=$((mismatches + 1))
-    fi
-  done < "$WORK_DIR/source_counts.txt"
-  (( mismatches == 0 )) || log "WARN: $mismatches count mismatch(es); counts were taken just before the dump, so a live source can drift slightly"
   done_step
 
   log ""
